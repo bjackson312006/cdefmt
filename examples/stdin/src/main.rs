@@ -53,10 +53,20 @@ fn main_impl() -> std::result::Result<(), anyhow::Error> {
         stdin.read_exact(current_buff)?;
         let log = decoder
             .decode_log(current_buff)
-            .and_then(|l| l.to_string().map(|s| (s, l.get_level())));
+            .and_then(|l| l.to_string().map(|s| (s, l.get_level(), l.get_file().to_string(), l.get_line(), l.get_func().map(str::to_string))));
 
         match log {
-            Ok((log, level)) => println!("{:<7} > {}", format!("{:?}", level), log),
+            Ok((log, level, file, line, func)) => {
+                let file = std::path::Path::new(&file)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(&file);
+                let func = func.as_deref().unwrap_or("?");
+                println!(
+                    "[{}/{}():{}] {:<7} > {}",
+                    file, func, line, format!("{:?}", level), log
+                );
+            }
             Err(e) => println!("Error: {:?}", e),
         }
     }

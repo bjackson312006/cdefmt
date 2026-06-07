@@ -31,6 +31,7 @@ pub struct Metadata<'elf> {
     pub fmt: &'elf str,
     pub names: Vec<&'elf str>,
     pub level: Level,
+    pub func: Option<String>,
 }
 
 fn parse_metadata_impl<'elf>(
@@ -85,6 +86,7 @@ fn parse_metadata_impl<'elf>(
             fmt,
             names,
             level: unsafe { std::mem::transmute::<u8, Level>(level) },
+            func: None,
         },
         offset,
     ))
