@@ -2,7 +2,7 @@ use gimli::{AttributeValue, DebuggingInformationEntry, ReaderOffset, UnitOffset}
 use gimli::{EndianSlice, EntriesCursor, Reader, Unit};
 use object::{File, Object, ObjectSection, ReadRef};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self};
 
 use crate::Error;
@@ -195,6 +195,163 @@ impl<'elf> Dwarf<'elf> {
             &compilation_unit,
             &entry
         )
+    }
+
+    /// Walks the entire DWARF tree once and builds a map from each
+    /// `cdefmt_log_metadata*` variable's address to the name of the function
+    /// (`DW_TAG_subprogram` / `DW_TAG_inlined_subroutine`) that lexically
+    /// encloses it.
+    ///
+    /// Output:
+    /// * Returns `Ok` if the function map was successfully created. The map
+    ///   may be empty (e.g. when the elf has no debug info).
+    /// * Returns `Err` if an error is encountered.
+    pub(crate) fn build_function_map(&'elf self) -> Result<HashMap<u64, String>> {
+        /// Walks a single compilation unit, inserting one entry into `map`
+        /// for every `cdefmt_log_metadata*` variable whose enclosing
+        /// function can be determined.
+        ///
+        /// Output:
+        /// * Returns `Ok` once the entire unit has been traversed.
+        /// * Returns `Err` if a DWARF read fails partway through.
+        fn walk_unit<R: Reader>(
+            dwarf: &gimli::Dwarf<R>,
+            unit: &Unit<R>,
+            map: &mut HashMap<u64, String>,
+        ) -> Result<()> {
+            let mut subprogram_stack: Vec<(isize, String)> = Vec::new();
+            let mut entries = unit.entries();
+
+            loop {
+                // Depth of the entry that the next `next_entry` call will read.
+                let depth = entries.next_depth();
+                if !entries.next_entry()? {
+                    break;
+                }
+
+                let entry = match entries.current() {
+                    Some(e) => e,
+                    None => continue,
+                };
+
+                subprogram_stack.retain(|(d, _)| *d < depth); // Any subprograms recorded at depth >= ours are siblings or cousins, not ancestors, so they need to come off the stack.
+
+                match entry.tag() {
+                    gimli::DW_TAG_subprogram | gimli::DW_TAG_inlined_subroutine => {
+                        if let Some(name) = get_die_name(dwarf, unit, entry) {
+                            subprogram_stack.push((depth, name));
+                        }
+                    }
+                    gimli::DW_TAG_variable => {
+                        let name_matches = get_die_name(dwarf, unit, entry)
+                            .map(|n| n.starts_with("cdefmt_log_metadata"))
+                            .unwrap_or(false);
+                        if !name_matches {
+                            continue;
+                        }
+
+                        // We've identified a metadata variable. Now, figure
+                        // out its load address (= the key the rest of the
+                        // parser uses to look up logs) and the function
+                        // that owns it.
+                        let address = match extract_variable_address(unit, entry)? {
+                            Some(a) => a,
+                            None => continue,
+                        };
+
+                        if let Some((_, func)) = subprogram_stack.last() {
+                            map.insert(address, func.clone());
+                        }
+                        // If no enclosing subprogram (file-scope metadata), we simply leave the entry unmapped.
+                    }
+                    _ => {}
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Convenience accessor for `DW_AT_name`, returning the string as an
+        /// owned `String` so it can outlive the borrow of the DIE.
+        ///
+        /// Output:
+        /// * Returns `Some` if the DIE has a readable `DW_AT_name`.
+        /// * Returns `None` if the attribute is missing or unreadable.
+        fn get_die_name<R: Reader>(
+            dwarf: &gimli::Dwarf<R>,
+            unit: &Unit<R>,
+            entry: &DebuggingInformationEntry<R>,
+        ) -> Option<String> {
+            let attr = entry.attr_value(gimli::DW_AT_name)?;
+            let slice = dwarf.attr_string(unit, attr).ok()?;
+            let cow = slice.to_string().ok()?;
+            Some(cow.into_owned())
+        }
+
+        /// Evaluates a variable DIE's `DW_AT_location` and returns the
+        /// address it resolves to.
+        ///
+        /// Output:
+        /// * Returns `Ok(Some)` if a static load address was recovered.
+        /// * Returns `Ok(None)` if the DIE has no `DW_AT_location`, the
+        ///   location is not an `Exprloc`, or the expression resolves to
+        ///   something other than a static address.
+        /// * Returns `Err` if gimli fails to evaluate the expression.
+        fn extract_variable_address<R: Reader>(
+            unit: &Unit<R>,
+            entry: &DebuggingInformationEntry<R>,
+        ) -> Result<Option<u64>> {
+            let location = match entry.attr_value(gimli::DW_AT_location) {
+                Some(loc) => loc,
+                None => return Ok(None),
+            };
+
+            let expr = match location {
+                AttributeValue::Exprloc(expr) => expr,
+                _ => return Ok(None),
+            };
+
+            // Drive the evaluation to completion. For static metadata
+            // variables the only "Requires" branch we expect to see is
+            // `RequiresRelocatedAddress`, which gimli emits for `DW_OP_addr`
+            // operations so the caller can apply load-time relocations. Our
+            // `.cdefmt` section is linked at zero and never relocated, so
+            // we pass the address straight back. Any other "Requires" branch
+            // means the location depends on live program state
+            // (registers/memory) which we can't satisfy from an ELF alone,
+            // so we give up and let the caller treat the variable as "no
+            // known address".
+            let mut eval = expr.evaluation(unit.encoding());
+            let mut result = eval.evaluate()?;
+            loop {
+                match result {
+                    gimli::EvaluationResult::Complete => break,
+                    gimli::EvaluationResult::RequiresRelocatedAddress(addr) => {
+                        result = eval.resume_with_relocated_address(addr)?;
+                    }
+                    _ => return Ok(None),
+                }
+            }
+
+            for piece in eval.result() {
+                if let gimli::Location::Address { address } = piece.location {
+                    return Ok(Some(address));
+                }
+            }
+
+            Ok(None)
+        }
+
+        let dwarf = self.borrow();
+        let mut map = HashMap::new();
+
+        let mut units = dwarf.units();
+        while let Some(header) = units.next()? {
+            let unit = dwarf.unit(header)?;
+            walk_unit(&dwarf, &unit, &mut map)?;
+        }
+
+        Ok(map)
     }
 
     /// Converts self into an EndianSlice Dwarf.

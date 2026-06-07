@@ -1,5 +1,7 @@
 //! Contains logic related to finding logs in the elf and parsing them.
 
+use std::collections::HashMap;
+
 use object::{AddressSize, Object, ObjectSection, ObjectSymbol, ReadRef};
 
 use crate::{
@@ -16,6 +18,7 @@ pub struct Parser<'elf> {
     dwarf: Dwarf<'elf>,
     address_size: AddressSize,
     metadata_addresses: Vec<u64>,
+    function_map: HashMap<u64, String>, // Maps each `cdefmt_log_metadata*` variable's load address to the name of the function that lexically encloses it.
 }
 
 impl<'elf> Parser<'elf> {
@@ -37,21 +40,29 @@ impl<'elf> Parser<'elf> {
             .map(|s| s.address())
             .collect::<Vec<_>>();
 
+        let logs_section = file
+            .section_by_name(".cdefmt")
+            .ok_or(Error::MissingSection)?
+            .data()?;
+
+
+        let function_map = dwarf.build_function_map()?;
+
         Ok(Parser {
-            logs_section: file
-                .section_by_name(".cdefmt")
-                .ok_or(Error::MissingSection)?
-                .data()?,
+            logs_section,
             build_id,
             dwarf,
             address_size,
             metadata_addresses,
+            function_map,
         })
     }
 
     /// Returns a specific log's metadata.
     pub fn get_log_metadata(&self, id: usize) -> Result<Metadata<'elf>> {
-        parse_metadata(self.logs_section, id, self.endian())
+        let mut metadata = parse_metadata(self.logs_section, id, self.endian())?;
+        metadata.func = self.function_map.get(&(id as u64)).cloned();
+        Ok(metadata)
     }
 
     /// Returns an iterator over all of the log's metadata/type information.

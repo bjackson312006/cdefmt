@@ -32,6 +32,10 @@ impl<'elf> Log<'elf> {
         self.metadata.line
     }
 
+    pub fn get_func(&self) -> Option<&str> {
+        self.metadata.func.as_deref()
+    }
+
     pub fn get_args(&self) -> &[Var] {
         &self.args
     }
